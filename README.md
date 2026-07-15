@@ -24,7 +24,13 @@ const mppx = Mppx.create({
       originAsset: 'eip155:42161/erc20:0xaf88d065e77c8cC2239327C5EDb3A432268e5831',
       destinationAsset: 'near:mainnet/nep141:1720…33a1',
       destinationRecipient: 'merchant.near',
-      refundTo: '0x2527…C317', // merchant origin-chain refund address
+      // Resolve before minting the wet quote so refunds return to the payer.
+      // Authenticate/rate-limit this hint in a real service.
+      refundTo: ({ capturedRequest }) => {
+        const address = capturedRequest?.headers.get('near-intents-refund-to')
+        if (!address) throw new Error('missing payer refund address')
+        return address
+      },
       amountOut: '1000000', // exact amount the merchant receives (EXACT_OUTPUT)
       oneClick: { jwt: process.env.ONE_CLICK_JWT },
       // production: store: Store.redis(client) — replay protection needs an atomic store
@@ -46,15 +52,19 @@ const mppx = Mppx.create({
       policy: {
         allowedOriginNetworks: ['eip155:42161'],
         maxAmountIn: { 'eip155:42161/erc20:0xaf88…5831': '5000000' },
+        expectedRefundTo: walletClient.account.address,
       },
     }),
   ],
 })
-const response = await mppx.fetch('https://api.example.com/paid-resource')
+const response = await mppx.fetch('https://api.example.com/paid-resource', {
+  headers: { 'near-intents-refund-to': walletClient.account.address },
+})
 ```
 
 Non-EVM origins (BTC, Solana, …) pay via the `sendDeposit` callback or present
-an already-broadcast tx hash as `context.hash`.
+an already-broadcast tx hash as `context.hash`. Pin their refund address with
+`policy.expectedRefundTo` before paying.
 
 ## Demo
 
@@ -83,6 +93,27 @@ Arbitrum account and run `pnpm example:client`, or send the deposit yourself
 and re-run with `DEPOSIT_TX_HASH=0x…`. The client refuses anything beyond its
 configured `policy.maxAmountIn` caps.
 
+### Manual live 1Click smoke
+
+`pnpm smoke:live` is an explicit, two-phase real-funds harness kept outside
+the test suite and CI. It validates current token mapping, wet quote creation,
+status polling, origin-hash observation, terminal outcomes, and destination
+receipt hashes without holding a private key.
+
+1. Copy `.env.example`, set `LIVE_ONE_CLICK=1`, `ONE_CLICK_JWT`, the
+   `LIVE_*_ASSET` values, amount, destination recipient, and a
+   payer-controlled `LIVE_REFUND_TO`; run `pnpm smoke:live` and inspect the
+   resulting quote.
+2. Broadcast `amountIn` to the printed deposit address using an external
+   wallet. Then rerun with `LIVE_DEPOSIT_ADDRESS`, `LIVE_DEPOSIT_TX_HASH`, and
+   `LIVE_DEPOSIT_MEMO` when present.
+3. The default expected terminal is `SUCCESS`. Set `LIVE_EXPECT_STATUS` when
+   validating a known `REFUNDED`, `FAILED`, or `INCOMPLETE_DEPOSIT` case.
+
+The safety switch prevents accidental network calls. Without a JWT, a second
+explicit switch (`LIVE_ALLOW_UNAUTHENTICATED=1`) is required to accept the
+1Click unauthenticated fee.
+
 ## Operational notes
 
 - **Trust model.** Settlement is not trustless: for the duration of the swap
@@ -91,10 +122,15 @@ configured `policy.maxAmountIn` caps.
   the destination asset to the merchant or refunds the deposit. Comparable to
   entrusting a payment processor with a transfer; agents applying per-method
   risk policies can key off the `method` and `settlementBackend` fields.
-- **Refunds.** `methodDetails.refundTo` is a **merchant-configured** address
-  on the origin chain (the server cannot know the payer before payment).
-  Every non-success terminal refunds the deposit there; payers recover
-  off-band per the merchant's terms. Disclose this in your terms of service.
+- **Refunds.** Prefer the async `refundTo` resolver and derive the address
+  from authenticated payer context before minting the wet quote. The resolved
+  value is included in the 1Click quote and signed challenge; clients MUST pin
+  it with `policy.expectedRefundTo`. A fixed string remains supported for custodial merchants,
+  but refunds then require an explicitly documented off-band recovery policy.
+- **Payer hints.** A raw refund-address header is convenient for a reference
+  service but is not authentication. Validate the address format, bind it to
+  the caller, and rate-limit unique hints to prevent unbounded wet-quote and
+  store creation.
 - **Per-origin expiry.** Size `expiresWindow` (and the mppx route `expires`)
   to the origin chain: minutes for fast chains, 45–60 minutes for Bitcoin.
   The example server creates the route handler per request so the absolute
@@ -113,6 +149,10 @@ configured `policy.maxAmountIn` caps.
 - **After a failed settlement** the immediate 402 echoes the spent challenge
   (mppx computes the retry challenge before `verify` runs); the client's next
   request receives a fresh quote. Conformant clients re-request on 402.
+- **Idempotency.** Hash claims and terminal consumption are atomic when the
+  configured store is atomic. The application still owns `Idempotency-Key`
+  handling for protected POST side effects; do not treat payment replay
+  protection as response-body idempotency.
 
 ## Observability
 
@@ -197,6 +237,7 @@ primitives from the spec's examples.
 ```sh
 npx pnpm@11 install   # pnpm pinned via packageManager
 pnpm check            # typecheck + lint + tests
+pnpm release:check    # full checks, build, and package-content dry run
 ```
 
 Tests are **mock-only** (in-process mock 1Click server in
@@ -208,6 +249,10 @@ receipt-extensibility fix ([wevm/mppx#612](https://github.com/wevm/mppx/pull/612
 that lets the method-specific receipt fields (`challengeId`, `originTxHash`,
 `destinationNetwork`) survive the `Payment-Receipt` codec; earlier releases
 strip them. mppx is an exact-pinned peer dependency while it is pre-1.0.
+
+The package intentionally remains `private: true` and version `0.0.0` until
+the owning NEAR Intents npm scope is selected. Remove that release gate only
+in the publication PR; `publishConfig` is already set for public provenance.
 
 ## License
 

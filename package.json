@@ -26,10 +26,12 @@
   ],
   "files": [
     "dist",
+    "scripts/live-oneclick-smoke.ts",
     "src",
     "!src/**/*.test.ts"
   ],
   "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -57,11 +59,17 @@
     "lint": "biome check .",
     "lint:fix": "biome check --write .",
     "prepack": "pnpm build",
+    "release:check": "pnpm check && pnpm build && pnpm pack --dry-run",
+    "smoke:live": "tsx scripts/live-oneclick-smoke.ts",
     "test": "vitest run"
   },
   "packageManager": "pnpm@11.10.0",
   "engines": {
     "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
   },
   "dependencies": {
     "zod": "^4.4.3"
